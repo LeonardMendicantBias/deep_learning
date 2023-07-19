@@ -8,7 +8,7 @@ from torchvision.ops import StochasticDepth, Permute, MLP
 
 from torchvision.datasets import ImageNet, CocoDetection
 
-import lightning.pytorch as pl
+import lightning as pl
 import torchmetrics
 
 import net

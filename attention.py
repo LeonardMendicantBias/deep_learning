@@ -38,15 +38,13 @@ class MultiHeadAttention(nn.Module):
     def build_linear(self):
         return nn.Linear(self.embed_dim, self.embed_dim)
     
-    def _headify(self, x: Tensor):  # split the last dim
+    def _headify(self, x: Tensor):
         B, T, D = x.size()
-        x = x.view(B, T, self.num_heads, D//self.num_heads).transpose(1, 2)
-        return x  # (B, H, T, D)
+        return x.view(B, T, self.num_heads, D//self.num_heads).transpose(1, 2)
     
-    def _deheadify(self, x: Tensor):  # merge the last two dims
+    def _deheadify(self, x: Tensor):
         B, H, T, D = x.shape
-        x = x.transpose(1, 2).reshape(B, T, H*D)
-        return x
+        return x.transpose(1, 2).reshape(B, T, H*D)
     
     def _calculate_logits(self, q: Tensor, k: Tensor):
         return (q @ k.mT) / math.sqrt(self.embed_dim)
@@ -90,7 +88,8 @@ class ShiftWindowMHA(MultiHeadAttention):
     def __init__(self, 
             window_size: Union[int, Tuple[int, int]],
             shift_size: Union[int, Tuple[int, int]],
-            embed_dim: int, num_heads: int, attention_dropout: float, dropout: float
+            embed_dim: int, num_heads: int,
+            attention_dropout: float, dropout: float
         ):
         super().__init__(embed_dim, num_heads, attention_dropout, dropout)
         self.window_size = torch.tensor(window_size, dtype=torch.int)
@@ -104,12 +103,6 @@ class ShiftWindowMHA(MultiHeadAttention):
         )
         self.define_relative_position_bias_table()
         self.define_relative_position_index()
-
-    def build_query(self):
-        return nn.Linear(self.embed_dim, self.embed_dim, bias=False)
-
-    def build_key(self):
-        return nn.Linear(self.embed_dim, self.embed_dim, bias=False)
 
     def define_relative_position_index(self):
         # get pair-wise relative position index for each token inside the window
@@ -155,87 +148,88 @@ class ShiftWindowMHA(MultiHeadAttention):
             Updated logit calculation that uses cosine instead of dot-product
         '''
         logit_scale = torch.clamp(self.logit_scale, max=math.log(100.0)).exp()
-        attn = F.normalize(q, dim=-1) @ F.normalize(k, dim=-1).transpose(-2, -1)
-        # relative_position_bias = 
+        # attn = F.normalize(q, dim=-1) @ F.normalize(k, dim=-1).transpose(-2, -1)
+        attn = F.normalize(q, dim=-1) @ F.normalize(k, dim=-1).mT
         return attn * logit_scale + self.get_relative_position_bias()
     
     def _attention(self, logits: Tensor, mask: Tensor):
         if mask is not None:
-            # print(logits.shape)
             logits = logits.view(logits.size(0) // 4, 4, self.num_heads, logits.size(2), logits.size(2))
-            # print(logits.shape, mask.unsqueeze(1).shape)
             logits = logits.masked_fill(mask.unsqueeze(1).unsqueeze(0), float('-inf'))
             logits = logits.view(-1, self.num_heads, logits.size(-1), logits.size(-2))
         return F.softmax(logits, dim=-1)
 
-    def _cyclic_shift(self, img: Tensor):
-        size = torch.tensor([img.size(1), img.size(2)], dtype=torch.int)
-        shift = torch.where(self.window_size >= size, 0, self.shift_size)
-        shift_img = torch.roll(img, shifts=(-shift[0], -shift[1]), dims=(1, 2))
-        
-        if sum(shift) > 0:
-            num_windows = (img.size(1) // self.window_size[0]) * (img.size(2) // self.window_size[1])
-            # generate attention mask
-            attn_mask = img.new_zeros((img.size(1), img.size(2)), dtype=torch.int)
-            h_slices = ((0, -self.window_size[0]), (-self.window_size[0], -shift[0]), (-shift[0], None))
-            w_slices = ((0, -self.window_size[1]), (-self.window_size[1], -shift[1]), (-shift[1], None))
-            count = 0
-            for h in h_slices:
-                for w in w_slices:
-                    attn_mask[h[0] : h[1], w[0] : w[1]] = count
-                    count += 1
-            attn_mask = attn_mask.view(img.size(1) // self.window_size[0], self.window_size[0], img.size(2) // self.window_size[1], self.window_size[1])
-            attn_mask = attn_mask.permute(0, 2, 1, 3).reshape(num_windows.prod(), self.window_size[0] * self.window_size[1])
-            attn_mask = attn_mask.unsqueeze(1) != attn_mask.unsqueeze(2)
+    def _cyclic_shift(self, img: Tensor, size: Tensor):
+        return torch.roll(img, shifts=(-size[0], -size[1]), dims=(1, 2))
+    
+    def _create_mask(self, img: Tensor, size: Tensor):
+        H, W = img.size(1), img.size(2)
+        w_s = self.window_size
+        num_windows = (H // w_s[0]) * (W // w_s[1])
+        # generate attention mask
+        attn_mask = img.new_zeros((H, W), dtype=torch.int, device=img.device)
+        h_slices = ((0, -w_s[0]), (-w_s[0], -size[0]), (-size[0], None))
+        w_slices = ((0, -w_s[1]), (-w_s[1], -size[1]), (-size[1], None))
+        count = 0
+        for h in h_slices:
+            for w in w_slices:
+                attn_mask[h[0] : h[1], w[0] : w[1]] = count
+                count += 1
+        attn_mask = attn_mask.view(H//w_s[0], w_s[0], W//w_s[1], w_s[1])
+        attn_mask = attn_mask.permute(0, 2, 1, 3).reshape(num_windows.prod(), w_s.prod())
+        attn_mask = attn_mask.unsqueeze(1) != attn_mask.unsqueeze(2)
 
-        x = self._reshape(shift_img, attn_mask)
-        
-        img = torch.roll(x, shifts=(shift[0], shift[1]), dims=(1, 2))
-        return img
+        return attn_mask
     
     def _pad(self, img: Tensor):
         size = torch.tensor([img.size(1), img.size(2)], dtype=torch.int, device=img.device)
         pad = (self.window_size - size%self.window_size)%self.window_size
-        pad_img = F.pad(img, (0, 0, 0, pad[1], 0, pad[0]))
-
-        img = self._cyclic_shift(pad_img)
-
+        img = F.pad(img, (0, 0, 0, pad[1], 0, pad[0]))
+        return img
+    
+    def _unpad(self, img: Tensor, size: Tensor):
         return img[:, :size[0], :size[1], :]
     
-    def _reshape(self, img: Tensor, mask: Tensor):
+    def _reshape(self, img: Tensor):
         B, H, W, D = img.size()
-
         w_s = self.window_size
+        n_windows = (H//w_s[0]) * (W//w_s[1])
         img = img.view(B, H//w_s[0], w_s[0], W//w_s[1], w_s[1], D)
         img = img.permute(0, 1, 3, 2, 4, 5)
-        img = img.reshape(B*(H//w_s[0])*(W//w_s[1]), w_s.prod(), D)
-
-        x = super().forward(img, mask)
-
-        img = x.reshape(B, H//w_s[0], W//w_s[1], w_s[0], w_s[1], D)
+        img = img.reshape(B*n_windows, w_s.prod(), D)
+        return img
+    
+    def _unshape(self, x: Tensor, size: Tensor):
+        w_s = self.window_size
+        img = x.reshape(-1, size[0]//w_s[0], size[1]//w_s[1], w_s[0], w_s[1], self.embed_dim)
         img = img.permute(0, 1, 3, 2, 4, 5)
-        img = img.reshape(B, H, W, D)
-
+        img = img.reshape(-1, size[0], size[1], self.embed_dim)
         return img
 
     def forward(self, img: Tensor, mask: Tensor=None):
-        x = self._pad(img)
+        img_size = torch.tensor(img.shape[1:3], dtype=torch.int, device=img.device)
+        # pad the image
+        img = self._pad(img)
+        pad_img_size = torch.tensor(img.shape[1:3], dtype=torch.int, device=img.device)
 
-        return x
+        # apply cyclic shift
+        shift_size = torch.where(self.window_size >= pad_img_size, 0, self.shift_size)
+        if shift_size.sum() > 0:
+            img = self._cyclic_shift(img, -shift_size)
+            if mask is not None:
+                mask = mask and self._create_mask(img, shift_size)
+            else:
+                mask = self._create_mask(img, shift_size) 
+        
+        # apply window-based self-attention
+        x = self._reshape(img)
+        x = super().forward(x, mask)
+        img = self._unshape(x, pad_img_size)
 
+        # unshift
+        if shift_size.sum() > 0:
+            img = self._cyclic_shift(img, shift_size)
 
-class DeformableMHA(MultiHeadAttention):
-
-    def __init__(self, num_levels: int, num_points: int, embed_dim: int, num_heads: int, attention_dropout: float, dropout: float):
-        super().__init__(embed_dim, num_heads, attention_dropout, dropout)
-        self.num_levels = num_levels
-
-        self.im2col_step = 64
-
-        self.sampling_offsets = nn.Linear(embed_dim, num_heads*num_levels*num_points*2)
-        self.attetntion_weights = nn.Linear(embed_dim, num_heads*num_levels*num_points)
-        self.value_proj = nn.Linear(embed_dim, embed_dim)
-        self.output_proj = nn.Linear(embed_dim, embed_dim)
-
-    def forward(self, x: Tensor, reference_points):
-        pass
+        # unpad
+        img = self._unpad(img, img_size)
+        return img
