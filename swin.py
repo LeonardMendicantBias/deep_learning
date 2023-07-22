@@ -3,9 +3,12 @@ from functools import partial
 
 import torch
 import torch.nn.functional as F
-from torch import nn, Tensor
+from torch import nn, Tensor, optim
 from torchvision.ops import StochasticDepth, Permute, MLP
 from torchvision.models import swin_v2_t, Swin_V2_T_Weights
+
+import lightning as pl
+import torchmetrics as metrics
 
 import attention
 
@@ -49,7 +52,7 @@ class SwinBlock(nn.Module):
     ) -> None:
         super().__init__()
 
-        self.norm1 = norm_layer(dim)
+        self.attn_norm = norm_layer(dim)
         self.attn = attn_layer(
             window_size,
             shift_size,
@@ -59,7 +62,7 @@ class SwinBlock(nn.Module):
             dropout,
         )
         self.stochastic_depth = StochasticDepth(stochastic_depth_prob, "row")
-        self.norm2 = norm_layer(dim)
+        self.mlp_norm = norm_layer(dim)
         self.mlp = MLP(dim, [int(dim*mlp_ratio), dim], activation_layer=nn.GELU, inplace=None, dropout=dropout)
         
         for m in self.mlp.modules():
@@ -69,10 +72,20 @@ class SwinBlock(nn.Module):
                     nn.init.normal_(m.bias, std=1e-6)
 
     def forward(self, x: Tensor):
-        x = x + self.stochastic_depth(self.norm1(self.attn(x)))
-        x = x + self.stochastic_depth(self.norm2(self.mlp(x)))
+        x = x + self.stochastic_depth(self.attn_norm(self.attn(x)))
+        x = x + self.stochastic_depth(self.mlp_norm(self.mlp(x)))
         return x
         
+
+class SwinTokenizer(nn.Sequential):
+
+    def __init__(self, embed_dim: int, patch_size: Tuple[int, int], norm_layer: Callable[..., nn.Module]):
+        super().__init__(
+            nn.Conv2d(3, embed_dim, kernel_size=patch_size, stride=patch_size),
+            Permute([0, 2, 3, 1]),
+            norm_layer(embed_dim)
+        )
+
 
 class SwinTransformer(nn.Module):
 
@@ -84,6 +97,7 @@ class SwinTransformer(nn.Module):
         num_heads: List[int],
         attention_dropout: float, dropout: float,
         stochastic_depth_prob: int,
+        # tokenizer: Callable[..., nn.Module]=None,
         norm_layer: Callable[..., nn.Module]=None,
         attn_block: Callable[..., nn.Module]=None,
     ):
@@ -100,6 +114,7 @@ class SwinTransformer(nn.Module):
             Permute([0, 2, 3, 1]),
             norm_layer(embed_dims[0])
         )
+        # self.tokenizer = tokenizer(embed_dims[0], patch_size, norm_layer)
 
         self.layers = nn.ModuleList([])
         total_stage_blocks = sum(depths)
@@ -111,8 +126,7 @@ class SwinTransformer(nn.Module):
                 sd_prob = stochastic_depth_prob * float(stage_block_id) / (total_stage_blocks-1)
                 stage.append(
                     SwinBlock(
-                        # embed_dims[i_stage],
-                        embed_dims[0] * 2**i_stage,
+                        embed_dims[i_stage],
                         num_heads[i_stage],
                         window_size=window_size,
                         shift_size=[0 if i_layer%2==0 else s//2 for s in window_size],
@@ -141,12 +155,13 @@ class SwinTransformer(nn.Module):
     
     @classmethod
     def arda_swin(cls):
+        # double the # of heads or # of dimensions
         return cls(
             patch_size=[4, 4],
             window_size=[8, 8],
             depths=[2, 2, 4, 2, 2],
-            embed_dims=[96, 96, 192, 384, 768],
-            num_heads=[3, 6, 6, 12, 24],
+            embed_dims=[96, 96, 192, 192, 384],
+            num_heads= [ 3,  6,   6,  12,  12],
             attention_dropout=0.1, dropout=0.1,
             stochastic_depth_prob=0.2
         )
@@ -193,8 +208,8 @@ class SwinTransformer(nn.Module):
                 b.attn.key.bias = nn.Parameter(t.attn.qkv.bias[d:d*2].clone())
                 b.attn.value.bias = nn.Parameter(t.attn.qkv.bias[-d:].clone())
                 # print(t.attn.query)
-                b.norm1.load_state_dict(t.norm1.state_dict())
-                b.norm2.load_state_dict(t.norm2.state_dict())
+                b.attn_norm.load_state_dict(t.norm1.state_dict())
+                b.mlp_norm.load_state_dict(t.norm2.state_dict())
                 b.mlp.load_state_dict(t.mlp.state_dict())
                 # b.attn.cpb_mlp.load_state_dict(t.attn.cpb_mlp.state_dict())
                 b.attn.linear.load_state_dict(t.attn.proj.state_dict())
@@ -205,4 +220,83 @@ class SwinTransformer(nn.Module):
         
         return swin
 
-# class SwinClassifier(nn.Module):
+
+class LitSwin(pl.LightningModule):
+    
+    def __init__(self,
+        patch_size: Tuple[int, int],
+        window_size: Tuple[int, int],
+        embed_dim: int,
+        depths: List[int],
+        num_heads: List[int],
+        attention_dropout: float, dropout: float,
+        stochastic_depth_prob: int,
+    ):
+        super().__init__()
+
+        self.swin = SwinTransformer.swin_t()
+        num_features = embed_dim * 2 ** (len(depths) - 1)
+        self.head = nn.Sequential(
+            nn.LayerNorm(num_features, eps=1e-5),
+            Permute([0, 3, 1, 2]),
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(1),
+            nn.Linear(num_features, 1000),
+        )
+        
+        self.accuracy = metrics.Accuracy(task="multiclass", num_classes=1000)
+
+    def forward(self, x):
+        return self.head(self.swin(x))
+
+    def training_step(self, batch, batch_idx):
+        x, y = batch
+        features = self.swin(x)
+        logits = self.head(features)
+        
+        loss = F.cross_entropy(logits, y)
+        self.log("train_loss", loss)
+        return loss
+    
+    def validation_step(self, batch, batch_idx):
+        x, y = batch
+        features = self.swin(x)
+        logits = self.head(features)
+        loss = F.cross_entropy(logits, y)
+        self.log("val_loss", loss)
+
+        self.accuracy.update(logits, y)
+        # self.log('valid_acc', self.accuracy, on_step=True, on_epoch=True)
+
+    def on_validation_epoch_end(self):
+        self.log('val_acc', self.accuracy.compute())
+        self.accuracy.reset()
+
+    def configure_optimizers(self):
+        optimizer = optim.Adam(self.parameters(), lr=1e-3)
+        return optimizer
+
+    # def _transfer_parameter(self, base, target):
+
+
+    @classmethod
+    def swin_t(cls):
+        model = swin_v2_t(Swin_V2_T_Weights.IMAGENET1K_V1)
+        swin = cls(
+            patch_size=[4, 4],
+            embed_dim=96,
+            depths=[2, 2, 6, 2],
+            num_heads=[3, 6, 12, 24],
+            window_size=[8, 8],
+            attention_dropout=0.1, dropout=0.1,
+            stochastic_depth_prob=0.2
+        )
+        # print(swin)
+        
+        layers = list(model.children())
+        layers_ = list(swin.swin.children())
+
+        for base, target in zip(swin.head.children(), layers[1:]):
+            base.load_state_dict(target.state_dict())
+
+        return swin
